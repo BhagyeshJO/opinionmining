@@ -2,6 +2,7 @@ import os, pandas as pd
 import streamlit as st
 from supabase import create_client
 from dateutil import parser
+import re
 
 st.set_page_config(page_title="Opinion Miner", layout="wide")
 st.title("📊 Social Opinion Miner")
@@ -40,12 +41,41 @@ df = pd.DataFrame(posts)
 if not df.empty:
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True, errors="coerce")
     df = df[df["created_at"] >= since]
-    if contains:
-        mask = (
-            df["text"].fillna("").str.contains(contains, case=False, na=False) |
-            df["title"].fillna("").str.contains(contains, case=False, na=False)
-        )
-        df = df[mask]
+    # --- Smarter text search ---
+search_mode = st.sidebar.radio(
+    "Search mode",
+    ["Any word", "All words", "Exact phrase"],
+    index=0,
+    help="Any word = OR. All words = AND. Exact phrase = literal match."
+)
+
+def make_mask(s: pd.Series, q: str) -> pd.Series:
+    s = s.fillna("")
+    if search_mode == "Exact phrase":
+        pattern = re.escape(q.strip())
+        return s.str.contains(pattern, case=False, na=False, regex=True)
+    else:
+        # split on spaces/commas; ignore empty tokens
+        words = [w for w in re.split(r"[,\s]+", q.strip()) if w]
+        if not words:
+            return pd.Series([True] * len(s), index=s.index)
+        if search_mode == "Any word":
+            # OR across words
+            m = pd.Series([False] * len(s), index=s.index)
+            for w in words:
+                m |= s.str.contains(re.escape(w), case=False, na=False, regex=True)
+            return m
+        else:  # All words
+            # AND across words
+            m = pd.Series([True] * len(s), index=s.index)
+            for w in words:
+                m &= s.str.contains(re.escape(w), case=False, na=False, regex=True)
+            return m
+
+if contains:
+    mask = make_mask(df["text"], contains) | make_mask(df["title"], contains)
+    df = df[mask]
+
 
 # ---- Join with analysis ----
 if not df.empty:
