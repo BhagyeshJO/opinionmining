@@ -1,24 +1,32 @@
 import os, time, json, requests, sys, hashlib
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, quote_plus
+from urllib.parse import urljoin
 
+# ----- Config & env -----
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
-# Allow a single keyword or a pipe-separated set of phrases:
-# e.g., "Should you buy Silver|silver investment|buy silver now"
 RAW_KW = os.environ.get("KEYWORD", "Should you buy Silver")
 QUERIES = [q.strip() for q in RAW_KW.split("|") if q.strip()]
 HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")
+REDDIT_USERNAME = os.environ.get("REDDIT_USERNAME")
+REDDIT_PASSWORD = os.environ.get("REDDIT_PASSWORD")
+
 if not all([SUPABASE_URL, SUPABASE_ANON_KEY, HF_TOKEN]):
-    print("✗ Missing one of SUPABASE_URL / SUPABASE_ANON_KEY / HF_TOKEN", file=sys.stderr)
+    print("✗ Missing SUPABASE_URL / SUPABASE_ANON_KEY / HF_TOKEN", file=sys.stderr)
+    sys.exit(1)
+if not all([REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD]):
+    print("✗ Missing one or more Reddit secrets (REDDIT_CLIENT_ID/SECRET/USERNAME/PASSWORD)", file=sys.stderr)
     sys.exit(1)
 
 SINCE_DT = datetime.now(timezone.utc) - timedelta(hours=HOURS)
 SINCE_UNIX = int(SINCE_DT.timestamp())
 
+UA = {"User-Agent": "opinion-miner/0.1 by github-actions"}
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 SB_HEADERS = {
     "apikey": SUPABASE_ANON_KEY,
@@ -26,42 +34,47 @@ SB_HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "resolution=merge-duplicates",
 }
-UA = {"User-Agent": "opinion-miner/0.1 by github-actions"}
 
-def reddit_search(query, limit=50, t="week"):
-    # Reddit public search endpoint (no auth). Returns posts, not comments.
-    url = "https://www.reddit.com/search.json"
-    try:
-        r = requests.get(
-            url,
-            params={"q": query, "sort": "new", "limit": str(limit), "t": t, "type": "link"},
-            headers=UA,
-            timeout=30
-        )
-        r.raise_for_status()
-        data = r.json().get("data", {}).get("children", [])
-        posts = []
-        for item in data:
-            d = item.get("data", {})
-            # Filter by created_utc >= SINCE
-            created = d.get("created_utc")
-            if created and int(created) < SINCE_UNIX:
-                continue
-            posts.append({
-                "id": d.get("id"),
-                "url": f"https://www.reddit.com{d.get('permalink','')}",
-                "author": d.get("author"),
-                "title": d.get("title") or "",
-                "selftext": d.get("selftext") or "",
-                "subreddit": d.get("subreddit"),
-                "created_utc": created or 0
-            })
-        print(f"✓ Reddit search '{query}' → {len(posts)} posts")
-        return posts
-    except Exception as e:
-        print(f"⚠️ Reddit search failed for '{query}': {e}", file=sys.stderr)
-        return []
+# ----- Reddit OAuth -----
+def reddit_token():
+    auth = requests.auth.HTTPBasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
+    data = {
+        "grant_type": "password",
+        "username": REDDIT_USERNAME,
+        "password": REDDIT_PASSWORD,
+    }
+    headers = {"User-Agent": UA["User-Agent"]}
+    r = requests.post("https://www.reddit.com/api/v1/access_token",
+                      auth=auth, data=data, headers=headers, timeout=30)
+    r.raise_for_status()
+    tok = r.json()["access_token"]
+    return tok
 
+def reddit_search_bearer(bearer, query, limit=50, sort="new", timeframe="month"):
+    headers = {"Authorization": f"bearer {bearer}", **UA}
+    params = {"q": query, "limit": str(limit), "sort": sort, "t": timeframe, "type": "link", "restrict_sr": False}
+    r = requests.get("https://oauth.reddit.com/search", headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json().get("data", {}).get("children", [])
+    posts = []
+    for item in data:
+        d = item.get("data", {})
+        created = d.get("created_utc") or 0
+        if int(created) < SINCE_UNIX:
+            continue
+        posts.append({
+            "id": d.get("id"),
+            "url": f"https://www.reddit.com{d.get('permalink','')}",
+            "author": d.get("author"),
+            "title": d.get("title") or "",
+            "selftext": d.get("selftext") or "",
+            "subreddit": d.get("subreddit"),
+            "created_utc": created
+        })
+    print(f"✓ Reddit OAuth search '{query}' → {len(posts)} posts")
+    return posts
+
+# ----- HF & Supabase helpers -----
 def hf_sentiment(text, retries=3):
     text = (text or "").strip()
     if not text:
@@ -73,8 +86,7 @@ def hf_sentiment(text, retries=3):
             r = requests.post(url, headers=HF_HEADERS, json=payload, timeout=60)
             if r.status_code == 503:
                 print("… HF 503 (loading), retrying in 6s")
-                time.sleep(6)
-                continue
+                time.sleep(6); continue
             r.raise_for_status()
             out = r.json()
             if isinstance(out, list) and out and isinstance(out[0], list):
@@ -97,22 +109,37 @@ def insert_analysis(a):
     r = requests.post(url, headers=SB_HEADERS, data=json.dumps([a]), timeout=60)
     r.raise_for_status()
 
+# ----- Main -----
 def main():
+    try:
+        bearer = reddit_token()
+        print("✓ Got Reddit bearer token")
+    except Exception as e:
+        print(f"✗ Reddit auth failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
     all_posts = []
     for q in QUERIES:
-        all_posts.extend(reddit_search(q, limit=50, t="month"))
+        try:
+            all_posts.extend(reddit_search_bearer(bearer, q, limit=50, sort="new", timeframe="month"))
+        except requests.HTTPError as e:
+            # Token might have expired mid-run (rare in one run). Try one refresh once.
+            if e.response is not None and e.response.status_code in (401, 403):
+                print("⚠️ Token issue, refreshing once…")
+                bearer = reddit_token()
+                all_posts.extend(reddit_search_bearer(bearer, q, limit=50, sort="new", timeframe="month"))
+            else:
+                print(f"⚠️ Reddit search failed for '{q}': {e}", file=sys.stderr)
 
     if not all_posts:
-        print("No posts fetched; try broadening KEYWORD or increasing LOOKBACK_HOURS.")
+        print("No posts fetched via OAuth. Consider increasing LOOKBACK_HOURS or broadening KEYWORD.")
         return
 
     inserted, analyzed = 0, 0
     for p in all_posts:
-        text_block = (p["title"] + "\n\n" + p["selftext"]).strip()
+        text_block = (p["title"] + ("\n\n" + p["selftext"] if p["selftext"] else "")).strip()
         if not text_block:
             continue
-
-        # Create a stable external_id based on reddit id + URL (for de-dupe safety)
         ext = p["id"] or p["url"]
         if not ext:
             ext = hashlib.sha256(text_block.encode("utf-8")).hexdigest()[:16]
@@ -127,8 +154,7 @@ def main():
             "language": "en",
         }
         try:
-            post_id = upsert_post(post)
-            inserted += 1
+            post_id = upsert_post(post); inserted += 1
         except Exception as e:
             print(f"⚠️ Post upsert failed for {ext}: {e}", file=sys.stderr)
             continue
@@ -141,8 +167,7 @@ def main():
             "model": MODEL,
         }
         try:
-            insert_analysis(a)
-            analyzed += 1
+            insert_analysis(a); analyzed += 1
         except Exception as e:
             print(f"⚠️ Analysis insert failed for {post_id}: {e}", file=sys.stderr)
         time.sleep(0.4)
