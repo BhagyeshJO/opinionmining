@@ -2,18 +2,21 @@ import os, time, json, requests, sys, hashlib
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
-# ---------- Config ----------
+# =========================
+# Env / Config
+# =========================
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
+
 RAW_KW = os.environ.get("KEYWORD", "Should you buy Silver")
 QUERIES = [q.strip() for q in RAW_KW.split("|") if q.strip()]
-HOURS = int(os.environ.get("LOOKBACK_HOURS", "168"))  # 7 days first run
+HOURS = int(os.environ.get("LOOKBACK_HOURS", "168"))  # default: 7 days
 MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 
 REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")
-REDDIT_USERNAME = os.environ.get("REDDIT_USERNAME")  # real username, not display name
+REDDIT_USERNAME = os.environ.get("REDDIT_USERNAME")  # real username (not display name)
 REDDIT_PASSWORD = os.environ.get("REDDIT_PASSWORD")
 
 if not all([SUPABASE_URL, SUPABASE_ANON_KEY, HF_TOKEN, REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET]):
@@ -22,18 +25,71 @@ if not all([SUPABASE_URL, SUPABASE_ANON_KEY, HF_TOKEN, REDDIT_CLIENT_ID, REDDIT_
 
 UA_STR = "opinion-miner/0.2 (by u/{})".format(REDDIT_USERNAME or "github-actions")
 UA = {"User-Agent": UA_STR}
+
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+
+# Return inserted/merged rows and dedupe on external_id
 SB_HEADERS = {
     "apikey": SUPABASE_ANON_KEY,
     "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates",
+    "Prefer": "return=representation,resolution=merge-duplicates",
 }
+
 SINCE_UNIX = int((datetime.now(timezone.utc) - timedelta(hours=HOURS)).timestamp())
 
-# ---------- Reddit OAuth helpers ----------
+# =========================
+# Helpers
+# =========================
+def normalize_sentiment_label(raw: str) -> str:
+    if not raw:
+        return "neutral"
+    r = raw.strip().lower()
+    mapping = {
+        "label_0": "negative",
+        "label_1": "neutral",
+        "label_2": "positive",
+        "negative": "negative",
+        "neutral": "neutral",
+        "positive": "positive",
+        "neg": "negative",
+        "pos": "positive",
+    }
+    return mapping.get(r, "neutral")
+
+def hf_sentiment(text, retries=3):
+    text = (text or "").strip()
+    if not text:
+        return "neutral", 0.0
+    payload = {"inputs": text[:5000]}
+    url = f"https://api-inference.huggingface.co/models/{MODEL}"
+    for i in range(retries):
+        r = requests.post(url, headers=HF_HEADERS, json=payload, timeout=60)
+        if r.status_code == 503:
+            print("… HF 503 (loading), retrying in 6s")
+            time.sleep(6); continue
+        try:
+            r.raise_for_status()
+        except Exception:
+            print(f"⚠️ HF error: {r.status_code} {r.text}", file=sys.stderr)
+            time.sleep(3); continue
+        out = r.json()
+        # HF sometimes wraps output inside another list
+        if isinstance(out, list) and out and isinstance(out[0], list):
+            out = out[0]
+        best = max(out, key=lambda x: x.get("score", 0)) if isinstance(out, list) else {"label":"neutral","score":0.0}
+        label = normalize_sentiment_label(best.get("label"))
+        score = float(best.get("score", 0.0))
+        return label, score
+    return "neutral", 0.0
+
+# =========================
+# Reddit OAuth
+# =========================
 def reddit_token_password():
     """Password grant (requires script app + username/password)."""
+    if not (REDDIT_USERNAME and REDDIT_PASSWORD):
+        return None
     auth = requests.auth.HTTPBasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
     data = {
         "grant_type": "password",
@@ -58,7 +114,7 @@ def reddit_token_password():
     return tok
 
 def reddit_token_app_only():
-    """Application-only (client_credentials). No username/password."""
+    """Application-only (client_credentials). No username/password needed."""
     auth = requests.auth.HTTPBasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
     data = {"grant_type": "client_credentials", "scope": "read"}
     r = requests.post("https://www.reddit.com/api/v1/access_token",
@@ -74,14 +130,11 @@ def reddit_token_app_only():
     return tok
 
 def get_reddit_token():
-    # Try password grant first if creds present
-    if REDDIT_USERNAME and REDDIT_PASSWORD:
-        tok = reddit_token_password()
-        if tok:
-            print("✓ Reddit token via password grant")
-            return tok
-        print("⚠️ Falling back to application-only token...")
-    # Fallback: app-only
+    tok = reddit_token_password()
+    if tok:
+        print("✓ Reddit token via password grant")
+        return tok
+    print("⚠️ Falling back to application-only token...")
     tok = reddit_token_app_only()
     if tok:
         print("✓ Reddit token via client_credentials")
@@ -114,42 +167,27 @@ def reddit_search_bearer(bearer, query, limit=50, sort="new", timeframe="year"):
     print(f"✓ Reddit search '{query}' → {len(posts)} posts")
     return posts
 
-# ---------- HF, Supabase ----------
-def hf_sentiment(text, retries=3):
-    text = (text or "").strip()
-    if not text:
-        return "neutral", 0.0
-    payload = {"inputs": text[:5000]}
-    url = f"https://api-inference.huggingface.co/models/{MODEL}"
-    for i in range(retries):
-        r = requests.post(url, headers=HF_HEADERS, json=payload, timeout=60)
-        if r.status_code == 503:
-            print("… HF 503 (loading), retrying in 6s")
-            time.sleep(6); continue
-        try:
-            r.raise_for_status()
-        except Exception as e:
-            print(f"⚠️ HF error: {r.status_code} {r.text}", file=sys.stderr)
-            time.sleep(3); continue
-        out = r.json()
-        if isinstance(out, list) and out and isinstance(out[0], list):
-            out = out[0]
-        best = max(out, key=lambda x: x.get("score", 0)) if isinstance(out, list) else {"label":"neutral","score":0.0}
-        return best["label"].lower(), float(best["score"])
-    return "neutral", 0.0
-
+# =========================
+# Supabase IO
+# =========================
 def upsert_post(p):
-    r = requests.post(urljoin(SUPABASE_URL, "/rest/v1/posts"),
-                      headers=SB_HEADERS, data=json.dumps([p]), timeout=60)
+    # on_conflict ensures dedupe by external_id; select=id returns a row body
+    url = urljoin(SUPABASE_URL, "/rest/v1/posts?on_conflict=external_id&select=id")
+    r = requests.post(url, headers=SB_HEADERS, data=json.dumps([p]), timeout=60)
     r.raise_for_status()
-    return r.json()[0]["id"]
+    data = r.json()
+    row = data[0] if isinstance(data, list) else data
+    return row["id"]
 
 def insert_analysis(a):
-    r = requests.post(urljoin(SUPABASE_URL, "/rest/v1/analysis"),
-                      headers=SB_HEADERS, data=json.dumps([a]), timeout=60)
+    url = urljoin(SUPABASE_URL, "/rest/v1/analysis?select=id")
+    r = requests.post(url, headers=SB_HEADERS, data=json.dumps([a]), timeout=60)
     r.raise_for_status()
+    return r.json()
 
-# ---------- Main ----------
+# =========================
+# Main
+# =========================
 def main():
     bearer = get_reddit_token()
 
@@ -170,7 +208,10 @@ def main():
         text_block = (p["title"] + ("\n\n" + p["selftext"] if p["selftext"] else "")).strip()
         if not text_block:
             continue
-        ext = p["id"] or p["url"] or hashlib.sha256(text_block.encode("utf-8")).hexdigest()[:16]
+
+        # stable external_id: reddit id if present; else hash text
+        ext = p.get("id") or p.get("url") or hashlib.sha256(text_block.encode("utf-8")).hexdigest()[:16]
+
         post = {
             "source": "reddit",
             "external_id": str(ext),
@@ -181,7 +222,8 @@ def main():
             "language": "en",
         }
         try:
-            post_id = upsert_post(post); inserted += 1
+            post_id = upsert_post(post)
+            inserted += 1
         except Exception as e:
             print(f"⚠️ Post upsert failed for {ext}: {e}", file=sys.stderr)
             continue
@@ -193,10 +235,12 @@ def main():
                 "sentiment": label,
                 "sentiment_score": round(score, 4),
                 "model": MODEL,
-            }); analyzed += 1
+            })
+            analyzed += 1
         except Exception as e:
             print(f"⚠️ Analysis insert failed for {post_id}: {e}", file=sys.stderr)
-        time.sleep(0.3)
+
+        time.sleep(0.3)  # be nice to APIs
 
     print(f"✓ Done. Upserted posts: {inserted}, analyses saved: {analyzed}")
 
