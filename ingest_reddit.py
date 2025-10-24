@@ -1,19 +1,24 @@
-import os, time, json, requests, sys
+import os, time, json, requests, sys, hashlib
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote_plus
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
-KEYWORD = os.environ.get("KEYWORD", "Should you buy Silver")
-HOURS = int(os.environ.get("LOOKBACK_HOURS", "6"))
+# Allow a single keyword or a pipe-separated set of phrases:
+# e.g., "Should you buy Silver|silver investment|buy silver now"
+RAW_KW = os.environ.get("KEYWORD", "Should you buy Silver")
+QUERIES = [q.strip() for q in RAW_KW.split("|") if q.strip()]
+HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 
 if not all([SUPABASE_URL, SUPABASE_ANON_KEY, HF_TOKEN]):
     print("✗ Missing one of SUPABASE_URL / SUPABASE_ANON_KEY / HF_TOKEN", file=sys.stderr)
     sys.exit(1)
 
-SINCE = int((datetime.now(timezone.utc) - timedelta(hours=HOURS)).timestamp())
+SINCE_DT = datetime.now(timezone.utc) - timedelta(hours=HOURS)
+SINCE_UNIX = int(SINCE_DT.timestamp())
+
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 SB_HEADERS = {
     "apikey": SUPABASE_ANON_KEY,
@@ -21,27 +26,52 @@ SB_HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "resolution=merge-duplicates",
 }
+UA = {"User-Agent": "opinion-miner/0.1 by github-actions"}
 
-def fetch_reddit(keyword, since):
-    url = "https://api.pushshift.io/reddit/search/comment/"
+def reddit_search(query, limit=50, t="week"):
+    # Reddit public search endpoint (no auth). Returns posts, not comments.
+    url = "https://www.reddit.com/search.json"
     try:
-        r = requests.get(url, params={"q": keyword, "after": since, "size": 50}, timeout=30)
+        r = requests.get(
+            url,
+            params={"q": query, "sort": "new", "limit": str(limit), "t": t, "type": "link"},
+            headers=UA,
+            timeout=30
+        )
         r.raise_for_status()
-        data = r.json().get("data", [])
-        print(f"✓ Fetched {len(data)} comments for '{keyword}' since {since}")
-        return data
+        data = r.json().get("data", {}).get("children", [])
+        posts = []
+        for item in data:
+            d = item.get("data", {})
+            # Filter by created_utc >= SINCE
+            created = d.get("created_utc")
+            if created and int(created) < SINCE_UNIX:
+                continue
+            posts.append({
+                "id": d.get("id"),
+                "url": f"https://www.reddit.com{d.get('permalink','')}",
+                "author": d.get("author"),
+                "title": d.get("title") or "",
+                "selftext": d.get("selftext") or "",
+                "subreddit": d.get("subreddit"),
+                "created_utc": created or 0
+            })
+        print(f"✓ Reddit search '{query}' → {len(posts)} posts")
+        return posts
     except Exception as e:
-        print(f"⚠️ Reddit fetch failed: {e}", file=sys.stderr)
+        print(f"⚠️ Reddit search failed for '{query}': {e}", file=sys.stderr)
         return []
 
 def hf_sentiment(text, retries=3):
+    text = (text or "").strip()
+    if not text:
+        return "neutral", 0.0
     payload = {"inputs": text[:5000]}
     url = f"https://api-inference.huggingface.co/models/{MODEL}"
     for i in range(retries):
         try:
             r = requests.post(url, headers=HF_HEADERS, json=payload, timeout=60)
             if r.status_code == 503:
-                # model cold-start
                 print("… HF 503 (loading), retrying in 6s")
                 time.sleep(6)
                 continue
@@ -68,33 +98,42 @@ def insert_analysis(a):
     r.raise_for_status()
 
 def main():
-    comments = fetch_reddit(KEYWORD, SINCE)
-    if not comments:
-        print("No comments fetched; exiting gracefully.")
+    all_posts = []
+    for q in QUERIES:
+        all_posts.extend(reddit_search(q, limit=50, t="month"))
+
+    if not all_posts:
+        print("No posts fetched; try broadening KEYWORD or increasing LOOKBACK_HOURS.")
         return
+
     inserted, analyzed = 0, 0
-    for c in comments:
-        text = c.get("body") or ""
-        if not text.strip():
+    for p in all_posts:
+        text_block = (p["title"] + "\n\n" + p["selftext"]).strip()
+        if not text_block:
             continue
+
+        # Create a stable external_id based on reddit id + URL (for de-dupe safety)
+        ext = p["id"] or p["url"]
+        if not ext:
+            ext = hashlib.sha256(text_block.encode("utf-8")).hexdigest()[:16]
+
         post = {
             "source": "reddit",
-            "external_id": str(c.get("id")),
-            "url": f"https://reddit.com{c.get('permalink','')}",
-            "author": c.get("author"),
-            "title": None,
-            "text": text,
-            "language": c.get("lang") or "en",
+            "external_id": str(ext),
+            "url": p["url"],
+            "author": p["author"],
+            "title": p["title"],
+            "text": text_block,
+            "language": "en",
         }
         try:
             post_id = upsert_post(post)
             inserted += 1
         except Exception as e:
-            # unique conflict is handled by Prefer=merge-duplicates, but still guard
-            print(f"⚠️ Post upsert failed for {post.get('external_id')}: {e}", file=sys.stderr)
+            print(f"⚠️ Post upsert failed for {ext}: {e}", file=sys.stderr)
             continue
 
-        label, score = hf_sentiment(text)
+        label, score = hf_sentiment(text_block)
         a = {
             "post_id": post_id,
             "sentiment": label,
@@ -106,7 +145,8 @@ def main():
             analyzed += 1
         except Exception as e:
             print(f"⚠️ Analysis insert failed for {post_id}: {e}", file=sys.stderr)
-        time.sleep(0.4)  # rate friendly
+        time.sleep(0.4)
+
     print(f"✓ Done. Upserted posts: {inserted}, analyses saved: {analyzed}")
 
 if __name__ == "__main__":
