@@ -1,14 +1,15 @@
 name: ingest
 on:
   schedule:
-    - cron: "0 */2 * * *"   # every 2 hours (UTC)
-  workflow_dispatch: {}
+    - cron: "0 */2 * * *"   # every 2 hours
+  workflow_dispatch: {}     # allows manual run
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -16,26 +17,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Show env (safe subset)
-        run: |
-          echo "PYTHON VERSION=$(python --version)"
-          echo "SUPABASE_URL set? -> ${SUPABASE_URL:+yes}"
-          echo "KEYWORD=$KEYWORD"
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          KEYWORD: ${{ secrets.KEYWORD }}
-
-      - name: Run ingest
+      - name: Run ingest script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KEYWORD: ${{ secrets.KEYWORD }}
-          LOOKBACK_HOURS: "24"     # widen for first run
+          LOOKBACK_HOURS: "168"                     # 7 days on first run
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
+          REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
         run: |
           python ingest_reddit.py
